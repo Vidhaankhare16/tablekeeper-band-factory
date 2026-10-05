@@ -1,0 +1,21 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(bash factory/bin/check-stage:*)",
+      "Bash(bash factory/bin/session-start.sh)",
+      "Bash(python3 factory/bin/band_say.py:*)",
+      "Edit",
+      "Write"
+    ],
+    "deny": [
+      "Bash(git push --force:*)", "Bash(git push -f:*)", "Bash(git push --force-with-lease:*)",
+      "Bash(git rebase:*)", "Bash(git reset --hard:*)", "Bash(git commit --amend:*)",
+      "Bash(git filter-branch:*)"
+    ]
+  },
+  "hooks": {
+    "SessionStart": [
+      {"hooks": [{"type": "command", "command": "bash factory/bin/session-start.sh", "async": true}]}
+    ]
+  }
+}

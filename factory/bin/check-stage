@@ -1,0 +1,80 @@
+#!/usr/bin/env bash
+# Factory check runner. Runs the event's supplied checks against a clean clone of this repository
+# at a given revision, then an offline start check of that stage's container.
+#
+#   bash factory/bin/check-stage --track <track> --stage <N> [--rev <revision>]
+#
+# Default revision: the current origin/main. Prints a short summary; full logs stay in the work
+# directory it names. Exit code 0 means both parts ran (read the summary for pass/fail).
+set -uo pipefail
+TRACK=""; STAGE=""; REV=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --track) TRACK="$2"; shift 2 ;;
+    --stage) STAGE="$2"; shift 2 ;;
+    --rev)   REV="$2"; shift 2 ;;
+    *) echo "check-stage: unknown argument $1" >&2; exit 2 ;;
+  esac
+done
+[ -n "$TRACK" ] && [ -n "$STAGE" ] || { echo "usage: check-stage --track T --stage N [--rev R]" >&2; exit 2; }
+
+HERE="$(cd "$(dirname "$0")" && pwd)"
+KIT=/tmp/kit; HV=/tmp/hv
+bash "$HERE/session-start.sh"
+
+# One-time setup per machine: the event kit (specs, partial checks, harness) and its runner.
+if [ ! -d "$KIT/.git" ]; then
+  git clone -q --depth 1 https://github.com/band-ai/dark-factory-wearedevs "$KIT" || { echo "check-stage: cannot clone the kit" >&2; exit 1; }
+fi
+if [ ! -f "$HV/.ready" ]; then
+  echo "check-stage: first run on this machine, installing the harness (a minute)"
+  { python3 -m venv "$HV" && "$HV/bin/pip" install -q -r "$KIT/harness/requirements.txt"; } >/tmp/check-stage-setup.log 2>&1     && touch "$HV/.ready" || { echo "check-stage: harness setup failed, see /tmp/check-stage-setup.log" >&2; tail -20 /tmp/check-stage-setup.log >&2; exit 1; }
+fi
+if [ ! -f "$HV/.browser" ]; then
+  echo "check-stage: installing a browser for the browser checks (a few minutes, once)"
+  "$HV/bin/python" -m playwright install --with-deps chromium >/tmp/check-stage-browser.log 2>&1     && touch "$HV/.browser"     || echo "check-stage: WARNING browser install failed (see /tmp/check-stage-browser.log); browser checks will error, API checks still run"
+fi
+
+# A clean clone at the requested revision.
+ROOT="$(git rev-parse --show-toplevel)"
+URL="$(git -C "$ROOT" remote get-url origin)"
+git -C "$ROOT" fetch -q origin
+REV="$(git -C "$ROOT" rev-parse "${REV:-origin/main}")"
+WORK="$(mktemp -d /tmp/check-XXXXXX)"
+git clone -q "$URL" "$WORK/repo" && git -C "$WORK/repo" checkout -q "$REV" \
+  || { echo "check-stage: cannot clone $URL at $REV" >&2; exit 1; }
+echo "== check-stage: track $TRACK, stage $STAGE, revision $REV"
+echo "   work directory: $WORK"
+
+echo "== supplied checks (partial; the judged suite is larger)"
+( cd "$KIT" && "$HV/bin/python" -m harness run --track "$TRACK" --repo "$WORK/repo" --stage "$STAGE" --out "$WORK/out" ) \
+  >"$WORK/harness.txt" 2>&1
+grep -E "stage [0-9]+:|highest contiguous|claimed stage|cannot build" "$WORK/harness.txt" | sed 's/^/   /'
+for counts in "$WORK"/out/stage-*.counts.json; do
+  [ -f "$counts" ] && echo "   $(basename "$counts" .counts.json): $(tr -d '\n ' < "$counts" | cut -c1-200)"
+done
+grep -qiE "429|toomanyrequests|failed to build|cannot build" "$WORK/harness.txt"   && { echo "   NOTE: the harness could not build the service image; tail:"; tail -8 "$WORK/harness.txt" | sed 's/^/   /'; }
+
+echo "== offline start check (no network, 2 vCPU, 2 GiB, healthy within 60 s)"
+IMG="check-stage-$(basename "$WORK" | tr 'A-Z' 'a-z')"
+built=""
+for attempt in 1 2 3; do
+  docker build -q -t "$IMG" "$WORK/repo/stage-$STAGE" >"$WORK/build.txt" 2>&1 && { built=1; break; }
+  grep -qiE "429|toomanyrequests|timeout" "$WORK/build.txt" || break
+  sleep $((attempt * 20))
+done
+if [ -n "$built" ]; then
+  CID="$(docker run -d --network none --cpus 2 --memory 2g -e PORT=8080 "$IMG")"
+  healthy=""
+  for i in $(seq 1 60); do
+    if docker run --rm --network "container:$CID" busybox:1.36 wget -qO- http://127.0.0.1:8080/health >"$WORK/health.txt" 2>/dev/null; then
+      healthy="$i"; break
+    fi
+    sleep 1
+  done
+  if [ -n "$healthy" ]; then echo "   healthy after ~${healthy}s: $(cat "$WORK/health.txt")"
+  else echo "   NOT healthy within 60 s; container log tail:"; docker logs "$CID" 2>&1 | tail -15 | sed 's/^/   /'; fi
+  docker rm -f "$CID" >/dev/null 2>&1
+else
+  echo "   BUILD FAILED:"; tail -15 "$WORK/build.txt" | sed 's/^/   /'
+fi
