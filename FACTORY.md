@@ -209,7 +209,38 @@ factory** before the judged run.
 
 Per stage (dispatch → ACCEPT): stage 1 21 min, stage 2 +32 min, stage 3 +23 min, stage 4 +1 h
 32 min. Stage 4 is dominated by the examiner's 700-check suite, including a real ~3-minute cutoff
-wait.
+wait. That is about **$11 per accepted stage**.
+
+### Where the cost went, and how to cut it
+
+Measured from `room.json` and the timeline above:
+
+- **The full-text handoff rule is the largest single driver.** The seats posted about 633,000
+  characters in the room. **About 587,000 of them (93 %) are the lead's**, and 38 of its 45
+  messages are the specification pasted in numbered parts. At every stage the work
+  orders went to each owner (builder, examiner and, from stage 2, surface) as **separate copies** of the same requirements,
+  and every receiving session reads them.
+- **Verification is the second, and it is deliberate.** Stage 4 took 1 h 32 min of the 2 h 49 min,
+  mostly the examiner's 700-check suite: every earlier stage re-run, upgrades from three earlier
+  builds, a brute-force planner oracle and a real ~3-minute cutoff wait. That is what "catches bad
+  work" costs, and we would keep it.
+
+Levers for the next run, none of which changes what the factory guarantees:
+
+1. **One requirements message per stage, addressed to all owners at once**, followed by short
+   per-seat work orders. The bridge already delivers a multi-mention message to every seat it names
+   (the review requests in this run did exactly that), so each seat still receives the complete
+   text, as the handoff rule requires. The lead then writes it once per stage instead of once per
+   seat, which on this run's numbers removes roughly half to two thirds of the lead's output.
+2. **A smaller model for the lead.** Its work is routing, copying and bookkeeping, and it never
+   writes code. Only its `Model:` line changes; the mandate does not.
+3. **Run the full regression of earlier stages once per stage.** In this run it ran in both the
+   examiner's ledger run and the gatekeeper's reproduction; keep the gatekeeper's clean-clone run
+   as the one that counts.
+
+We did not spend the remaining credit on a second judged run to demonstrate these. A new run would
+replace verified, accepted work with an unverified one, so we list them as measured opportunities,
+not results.
 
 ## Verification we did ourselves (not part of the band's run)
 
