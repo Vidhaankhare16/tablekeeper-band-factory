@@ -14,7 +14,9 @@ from .service import Service
 SERVICE = Service()
 STATIC_ROOT = Path(__file__).resolve().parent.parent / "static"
 SCREENS = {"/": "index.html", "/signup": "signup.html", "/login": "login.html", "/lookup": "lookup.html"}
-_REFERENCE_PATH = re.compile(r"/reservations/([^/]+)(/cancel)?")
+_REFERENCE_PATH = re.compile(r"/reservations/([^/]+)(/cancel|/history|/decision)?")
+_POLICIES_PATH = re.compile(r"/restaurants/([^/]+)/policies")
+_SERIES_PATH = re.compile(r"/series/([^/]+)")
 _RESTAURANT_PATH = re.compile(r"/restaurants/([^/]+)")
 
 
@@ -118,25 +120,38 @@ class Handler(BaseHTTPRequestHandler):
             ("POST", "/reservations"): lambda: service.create_reservation(auth, key, raw),
             ("GET", "/reservations"): lambda: service.list_reservations(auth),
             ("POST", "/reservation-moves"): lambda: service.moves(auth, key, raw),
+            ("POST", "/series"): lambda: service.create_series(auth, key, raw),
         }
         if (method, path) in routes:
             return routes[(method, path)]()
         match = _RESTAURANT_PATH.fullmatch(path)
         if match and method == "GET":
             return service.get_restaurant(match.group(1))
+        match = _POLICIES_PATH.fullmatch(path)
+        if match and method == "GET":
+            return service.list_policies(match.group(1))
+        if match and method == "POST":
+            return service.publish_policy(auth, match.group(1), key, raw)
+        series = _SERIES_PATH.fullmatch(path)
+        if series and method == "GET":
+            return service.get_series(auth, series.group(1))
         match = _REFERENCE_PATH.fullmatch(path)
         if match:
-            reference, cancel = match.group(1), match.group(2)
-            if cancel and method == "POST":
+            reference, action = match.group(1), match.group(2)
+            if action == "/cancel" and method == "POST":
                 return service.cancel(auth, reference)
-            if not cancel and method == "GET":
+            if action == "/history" and method == "GET":
+                return service.get_history(auth, reference)
+            if action == "/decision" and method == "GET":
+                return service.get_decision(auth, reference)
+            if not action and method == "GET":
                 return service.get_reservation(auth, reference)
-            if not cancel and method == "PATCH":
+            if not action and method == "PATCH":
                 return service.amend(auth, reference, raw)
         page = static_file(path) if method == "GET" else None
         if page:
             return 200, page
-        if match or path in {known for _, known in routes}:
+        if match or series or path in {known for _, known in routes}:
             raise ApiError(405, "method_not_allowed", "method not allowed")
         raise ApiError(404, "not_found", "no such endpoint")
 
