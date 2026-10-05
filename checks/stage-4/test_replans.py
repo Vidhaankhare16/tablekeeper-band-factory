@@ -345,7 +345,9 @@ def test_L4_10_fixed_bookings_and_previous_closures_constrain_the_plan():
     apply_ok(w.ada, "r_anker", j["plan_id"])
     # a second closure: t_3 closed [18:00,22:00); A (now on t_3) must go elsewhere but not t_1 (closed earlier, overlapping A) nor t_2
     j2 = pv(w, "t_3", "18:00", "22:00")
-    assert j2["assignments"][0]["table_ids"] == ["t_4"], f"[L4.10] previously applied closures constrain later plans: {j2}"
+    got2 = {x["reference"]: x for x in j2["assignments"]}
+    assert got2[a["reference"]]["table_ids"] == ["t_4"], f"[L4.10] previously applied closures constrain later plans: {j2}"
+    assert got2[fixed["reference"]]["table_ids"] == ["t_2"] and not got2[fixed["reference"]]["changed"], "[L4.9] the second closure also overlaps the former fixed booking, which is considered and stays"
 
 
 def test_L4_11_diners_cutoffs_do_not_block_repairs_and_booking_fields_are_preserved():
