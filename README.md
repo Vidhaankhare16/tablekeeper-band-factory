@@ -13,6 +13,8 @@ BAND room from **a single dispatched message**. No human wrote or changed any co
   stage on the shipped checks (120/120, 25/25, 7/7, 6/6), and none overshoots.
 - Behind that, the examiner seat's own suites reach 700 passing checks.
 
+**Live demo** (the band's `stage-4/` code, unchanged, hosted on Cloud Run with two demo restaurants loaded at start): https://tablekeeper-demo-896860697904.us-central1.run.app (log in as `demo@example.com` / `correct horse`, or sign up). State is in memory, as the spec allows, so the demo resets when the instance restarts.
+
 ## How to read this repository
 
 | Path | What it is |
