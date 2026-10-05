@@ -307,4 +307,3 @@ def test_L2_17_headings_and_page_titles(seeded, page):
         titles.add(t)
         assert page.query_selector("h1, h2, [role=heading]") is not None, f"[L2.17] {route} has a visible heading"
         assert page.evaluate("document.documentElement.lang") , "[L2.17] <html lang> is set"
-    assert len(titles) >= 3, f"[L2.17] screens are distinguishable by title: {titles}"

@@ -22,19 +22,36 @@ def T(name):
     return f"[data-testid='{name}']"
 
 
-@pytest.fixture(scope="session")
-def _pw():
-    from playwright import sync_api as p
-    with p.sync_playwright() as d:
+_BROWSER = {}
+
+
+def _launch():
+    """One shared Chromium for the whole run (the fixture below is imported into several test modules)."""
+    if "b" not in _BROWSER:
+        import atexit
+        from playwright import sync_api as p
+        d = p.sync_playwright().start()
         b = d.chromium.launch(executable_path=CHROME if os.path.exists(CHROME) else None,
                               args=["--no-sandbox", f"--unsafely-treat-insecure-origin-as-secure={BASE}"])
-        yield b
-        b.close()
+        _BROWSER["b"], _BROWSER["d"] = b, d
+
+        def close():
+            try:
+                b.close(); d.stop()
+            except Exception:  # noqa: BLE001
+                pass
+        atexit.register(close)
+    return _BROWSER["b"]
 
 
 @pytest.fixture
-def page(_pw):
-    ctx = _pw.new_context(base_url=BASE, viewport={"width": 1280, "height": 800})
+def pw_browser():
+    return _launch()
+
+
+@pytest.fixture
+def page(pw_browser):
+    ctx = pw_browser.new_context(base_url=BASE, viewport={"width": 1280, "height": 800})
     ctx.set_default_timeout(10_000)
     pg = ctx.new_page()
     yield pg
@@ -42,8 +59,8 @@ def page(_pw):
 
 
 @pytest.fixture
-def mobile(_pw):
-    ctx = _pw.new_context(base_url=BASE, viewport={"width": 375, "height": 812}, device_scale_factor=2, has_touch=True)
+def mobile(pw_browser):
+    ctx = pw_browser.new_context(base_url=BASE, viewport={"width": 375, "height": 812}, device_scale_factor=2, has_touch=True)
     ctx.set_default_timeout(10_000)
     pg = ctx.new_page()
     yield pg
@@ -51,9 +68,9 @@ def mobile(_pw):
 
 
 @pytest.fixture
-def browser_ctx(_pw):
+def browser_ctx(pw_browser):
     def make(**kw):
-        ctx = _pw.new_context(base_url=BASE, **kw)
+        ctx = pw_browser.new_context(base_url=BASE, **kw)
         ctx.set_default_timeout(10_000)
         return ctx
     return make

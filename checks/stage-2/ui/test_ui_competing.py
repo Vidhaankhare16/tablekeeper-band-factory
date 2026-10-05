@@ -169,9 +169,8 @@ def test_L2_4_conflict_on_combination_refreshes_and_preserves(seeded, page):
     page.wait_for_selector(T("booking-error"))
     assert page.query_selector(T("confirmation")) is None
     wait_cell(page, "t_2-19:00", False)
-    for k in ("t_2+t_3-19:00",):
-        assert cells(page).get(k) in (None, "false"), f"[L2.4/L2.7] {k} refreshed to unavailable"
-    assert cells(page).get("t_1+t_2-19:00") in (None, "false")
+    page.wait_for_function("""() => ['t_2+t_3-19:00', 't_1+t_2-19:00'].every(k => { const e = document.querySelector("[data-testid='slot-" + k + "']");
+        return !e || e.getAttribute('data-available') === 'false'; })""")     # refreshed availability reaches combination cells too
     assert page.query_selector(T("booking-form")) is not None and page.input_value(T("booking-party-size")) == "6"
     s = page.text_content(T("booking-summary"))
     assert "1" in s and "2" in s, f"[L2.4/L2.7] the combination selection is preserved: {s!r}"
