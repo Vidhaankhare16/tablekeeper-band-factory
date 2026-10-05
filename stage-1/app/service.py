@@ -219,7 +219,7 @@ class Service:
             raise not_found("no such restaurant")
         table_id, _, start_ts, end_ts = self._resolve_booking(
             restaurant, body["table_id"], party_size, naive, None)
-        self._require_free(table_id, start_ts, end_ts, ignore=())
+        self._require_free(restaurant["id"], table_id, start_ts, end_ts, ignore=())
         record = {"id": self.state.allocate_reservation_id(), "reference": self._new_reference(),
                   "user_id": user_id, "restaurant_id": restaurant["id"], "table_id": table_id,
                   "party_size": party_size, "status": "confirmed",
@@ -259,7 +259,8 @@ class Service:
             changes = self._parse_changes(parse_object(raw))
             record = self._owned(user_id, reference)
             plan = self._plan_amendment(record, changes)
-            self._require_free(plan["table_id"], plan["start_ts"], plan["end_ts"], ignore=(record["id"],))
+            self._require_free(record["restaurant_id"], plan["table_id"], plan["start_ts"], plan["end_ts"],
+                               ignore=(record["id"],))
             record.update(plan)
             return 200, self._view(record)
 
@@ -289,7 +290,8 @@ class Service:
         plans = [self._plan_amendment(record, change) for record, change in zip(records, changes)]
         listed = {r["id"] for r in records}
         for index, plan in enumerate(plans):
-            self._require_free(plan["table_id"], plan["start_ts"], plan["end_ts"], ignore=listed)
+            self._require_free(records[0]["restaurant_id"], plan["table_id"], plan["start_ts"], plan["end_ts"],
+                               ignore=listed)
             for other in plans[:index]:
                 if other["table_id"] == plan["table_id"] and \
                         other["start_ts"] < plan["end_ts"] and plan["start_ts"] < other["end_ts"]:
@@ -388,9 +390,10 @@ class Service:
             raise unprocessable("outside_opening_hours", "the reservation would end after closing")
         return start_ts, end_ts
 
-    def _require_free(self, table_id, start_ts, end_ts, ignore):
+    def _require_free(self, restaurant_id, table_id, start_ts, end_ts, ignore):
+        """409 when a confirmed booking other than those in `ignore` overlaps the table."""
         for res in self.state.reservations.values():
-            if res["table_id"] == table_id and res["status"] == "confirmed" and res["id"] not in ignore \
+            if res["restaurant_id"] == restaurant_id and res["table_id"] == table_id and res["status"] == "confirmed" and res["id"] not in ignore \
                     and res["start_ts"] < end_ts and start_ts < res["end_ts"]:
                 raise conflict("table_unavailable", "the table is taken for an overlapping interval")
 

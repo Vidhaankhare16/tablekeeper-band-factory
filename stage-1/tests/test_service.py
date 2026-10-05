@@ -151,6 +151,16 @@ class ServiceTest(unittest.TestCase):
         broken = dict(exported, format_version=2)
         self.assertEqual(self.code(lambda: self.svc.import_state(json.dumps(broken).encode())), "validation_failed")
 
+    def test_same_table_id_in_two_restaurants_is_two_tables(self):
+        fixture = json.loads(json.dumps(FIXTURE))
+        fixture["restaurants"][1]["tables"][0]["id"] = "t_2"
+        fixture["restaurants"][1]["opening_hours"] = fixture["restaurants"][0]["opening_hours"]
+        self.svc.reset(json.dumps(fixture).encode())
+        auth = "Bearer " + self.svc.login(body(email="ada@example.com", password="correct horse"))[1]["token"]
+        for restaurant in ("r_anker", "r_ny"):
+            status, _ = self.svc.create_reservation(auth, restaurant, book(restaurant=restaurant))
+            self.assertEqual(status, 201)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,5 +1,6 @@
 """The complete service state, its fixture loader and its export/import form."""
 import copy
+import re
 import time
 
 from . import timeutil
@@ -8,6 +9,7 @@ from .passwords import hash_password
 
 MAX_ID_LENGTH = 64
 STATUSES = ("confirmed", "cancelled")
+_REFERENCE = re.compile(r"[A-Z0-9]{6,12}", re.ASCII)
 
 
 class State:
@@ -221,15 +223,22 @@ def _load_fixture_reservation(state, raw):
     restaurant = state.restaurants[raw["restaurant_id"]]
     naive = timeutil.parse_local_datetime(raw["starts_at_local"])
     created_at = raw.get("created_at", timeutil.utc_now_rfc3339(time.time()))
+    if not _REFERENCE.fullmatch(raw["reference"]):
+        raise ValueError("reference must be 6 to 12 characters of A-Z0-9")
     if naive is None or status not in STATUSES or not isinstance(created_at, str) \
             or raw["id"] in state.reservations or raw["reference"] in state.by_reference \
             or all(t["id"] != raw["table_id"] for t in restaurant["tables"]):
         raise ValueError("invalid or duplicate seeded reservation")
     start_ts, _ = timeutil.resolve_local(timeutil.load_zone(restaurant["timezone"]), naive)
+    end_ts = start_ts + restaurant["reservation_duration_minutes"] * 60
+    if status == "confirmed" and any(
+            other["status"] == "confirmed" and other["restaurant_id"] == raw["restaurant_id"]
+            and other["table_id"] == raw["table_id"] and other["start_ts"] < end_ts and start_ts < other["end_ts"]
+            for other in state.reservations.values()):
+        raise ValueError("seeded reservations overlap on a table")
     state.add_reservation({
         "id": raw["id"], "reference": raw["reference"], "user_id": raw["user_id"],
         "restaurant_id": raw["restaurant_id"], "table_id": raw["table_id"],
         "party_size": party_size, "status": status,
         "starts_at_local": timeutil.format_local(naive), "start_ts": start_ts,
-        "end_ts": start_ts + restaurant["reservation_duration_minutes"] * 60,
-        "created_at": created_at})
+        "end_ts": end_ts, "created_at": created_at})
