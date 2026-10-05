@@ -162,5 +162,83 @@ class ServiceTest(unittest.TestCase):
             self.assertEqual(status, 201)
 
 
+class CombinedTablesTest(unittest.TestCase):
+    def setUp(self):
+        fixture = json.loads(json.dumps(FIXTURE))
+        fixture["restaurants"][0]["tables"].append({"id": "t_3", "label": "3", "capacity": 4})
+        fixture["restaurants"][0]["combinable"] = [["t_1", "t_2"], ["t_2", "t_3"]]
+        self.svc = Service(clock=lambda: NOW)
+        self.svc.reset(json.dumps(fixture).encode())
+        self.auth = "Bearer " + self.svc.login(body(email="ada@example.com", password="correct horse"))[1]["token"]
+        self.n = 0
+
+    def create(self, **kw):
+        self.n += 1
+        fields = dict(restaurant_id="r_anker", starts_at_local="2030-01-10T19:00", party_size=6)
+        return self.svc.create_reservation(self.auth, f"k{self.n}", body(**{**fields, **kw}))
+
+    def code(self, call):
+        with self.assertRaises(ApiError) as caught:
+            call()
+        return caught.exception.code
+
+    def test_pair_booking_occupies_both_tables(self):
+        view = self.create(table_ids=["t_2", "t_1"])[1]
+        self.assertEqual((view["table_ids"], "table_id" in view), (["t_1", "t_2"], False))
+        for table in ("t_1", "t_2"):
+            self.assertEqual(self.code(lambda: self.create(table_id=table, party_size=1)), "table_unavailable")
+        self.assertEqual(self.create(table_id="t_3", party_size=4)[0], 201)
+        self.svc.cancel(self.auth, view["reference"])
+        self.assertEqual(self.create(table_id="t_1", party_size=2)[1]["table_ids"], ["t_1"])
+
+    def test_combination_rules(self):
+        self.assertEqual(self.code(lambda: self.create(table_ids=["t_1", "t_3"], party_size=2)), "combination_not_allowed")
+        self.assertEqual(self.code(lambda: self.create(table_ids=["t_1", "t_2", "t_3"])), "combination_not_allowed")
+        self.assertEqual(self.code(lambda: self.create(table_ids=["t_1", "t_1"])), "validation_failed")
+        self.assertEqual(self.code(lambda: self.create(table_ids=["t_1"], table_id="t_1")), "validation_failed")
+        self.assertEqual(self.code(lambda: self.create(table_ids=["t_1", "t_2"], party_size=7)), "party_exceeds_capacity")
+        self.assertEqual(self.code(lambda: self.create(table_ids=["t_1", "nope"])), "not_found")
+
+    def test_availability_options(self):
+        self.create(table_id="t_3", party_size=4)
+        slots = self.svc.availability({"restaurant_id": "r_anker", "date": "2030-01-10", "party_size": "3"})[1]["slots"]
+        slot = next(s for s in slots if s["starts_at_local"] == "2030-01-10T19:00")
+        self.assertEqual(slot["available_table_ids"], ["t_2"])
+        self.assertEqual(slot["available_options"], [{"table_ids": ["t_2"], "capacity": 4},
+                                                      {"table_ids": ["t_1", "t_2"], "capacity": 6}])
+        slot = next(s for s in self.svc.availability({"restaurant_id": "r_anker", "date": "2030-01-10",
+                                                      "party_size": "3"})[1]["slots"]
+                    if s["starts_at_local"] == "2030-01-10T22:00")
+        self.assertEqual(len(slot["available_options"]), 4)
+
+    def test_amend_to_pair_and_moves(self):
+        a = self.create(table_id="t_2", party_size=2)[1]
+        patched = self.svc.amend(self.auth, a["reference"], body(table_ids=["t_1", "t_2"], party_size=6))[1]
+        self.assertEqual(patched["table_ids"], ["t_1", "t_2"])
+        b = self.create(table_id="t_3", party_size=4)[1]
+        clash = body(moves=[{"reference": b["reference"], "table_ids": ["t_2", "t_3"]}])
+        self.assertEqual(self.code(lambda: self.svc.moves(self.auth, "m", clash)), "table_unavailable")
+        self.svc.cancel(self.auth, a["reference"])
+        ok = self.svc.moves(self.auth, "m2", clash)
+        self.assertEqual(ok[1]["reservations"][0]["table_ids"], ["t_2", "t_3"])
+
+    def test_stage_1_export_is_accepted_and_receipts_stay_original(self):
+        stage1 = {"track": "tablekeeper", "format_version": 1, "state": {
+            "users": [{"id": "u_1", "email": "a@example.com", "display_name": "A", "password_hash": "x"}],
+            "tokens": {"tok": "u_1"},
+            "restaurants": [{k: v for k, v in FIXTURE["restaurants"][0].items()}],
+            "reservations": [{"id": "res_1", "reference": "ABC123", "user_id": "u_1", "restaurant_id": "r_anker",
+                              "table_id": "t_2", "party_size": 4, "status": "confirmed",
+                              "starts_at_local": "2030-01-10T19:00", "start_ts": 1894471200,
+                              "end_ts": 1894476600, "created_at": "2026-01-01T00:00:00+00:00"}],
+            "receipts": [{"user_id": "u_1", "method": "POST", "path": "/reservations", "key": "k",
+                          "body": "{}", "response": {"reference": "ABC123", "table_id": "t_2"}}],
+            "next_user": 2, "next_reservation": 2}}
+        self.svc.import_state(json.dumps(stage1).encode())
+        view = self.svc.get_reservation("Bearer tok", "ABC123")[1]
+        self.assertEqual((view["table_id"], view["table_ids"]), ("t_2", ["t_2"]))
+        self.assertEqual(self.svc.create_reservation("Bearer tok", "k", b"{}"), (200, {"reference": "ABC123", "table_id": "t_2"}))
+
+
 if __name__ == "__main__":
     unittest.main()

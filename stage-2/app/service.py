@@ -19,7 +19,8 @@ REFERENCE_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
 REFERENCE_LENGTH = 6
 _EMAIL = re.compile(r"[^@\s]+@[^@\s]+")
 _DIGITS = re.compile(r"[0-9]{1,18}", re.ASCII)
-_BOOKING_STRING_FIELDS = ("restaurant_id", "table_id", "starts_at_local")
+_BOOKING_STRING_FIELDS = ("restaurant_id", "starts_at_local")
+MAX_COMBINED_TABLES = 2
 
 
 def parse_object(raw):
@@ -46,6 +47,24 @@ def _require_strings(body, *fields):
     for field in fields:
         if field not in body:
             raise validation_failed(f"{field} is required")
+
+
+def _check_table_field_types(body):
+    if "table_id" in body and not isinstance(body["table_id"], str):
+        raise malformed_request("table_id must be a string")
+    if "table_ids" in body and not (isinstance(body["table_ids"], list)
+                                    and all(isinstance(t, str) for t in body["table_ids"])):
+        raise malformed_request("table_ids must be a list of strings")
+
+
+def _requested_tables(body):
+    """The table ids a request names (None when it names none); `table_id` is a set of one."""
+    if "table_id" in body and "table_ids" in body:
+        raise validation_failed("send table_id or table_ids, not both")
+    tables = [body["table_id"]] if "table_id" in body else body.get("table_ids")
+    if tables is not None and (not tables or len(set(tables)) != len(tables)):
+        raise validation_failed("table_ids must be a non-empty list without duplicates")
+    return tables
 
 
 def _valid_party_size(value):
@@ -178,8 +197,9 @@ class Service:
         taken = {}
         for res in self.state.reservations.values():
             if res["restaurant_id"] == restaurant["id"] and res["status"] == "confirmed":
-                taken.setdefault(res["table_id"], []).append((res["start_ts"], res["end_ts"]))
-        fitting = [t["id"] for t in restaurant["tables"] if t["capacity"] >= party_size]
+                for table_id in res["table_ids"]:
+                    taken.setdefault(table_id, []).append((res["start_ts"], res["end_ts"]))
+        capacities = {t["id"]: t["capacity"] for t in restaurant["tables"]}
         slots, seen = [], set()
         for entry in sorted((h for h in restaurant["opening_hours"] if h["weekday"] == weekday),
                             key=lambda h: timeutil.parse_clock(h["opens"])):
@@ -192,10 +212,17 @@ class Service:
                 if not exists or local in seen or start_ts + duration > closes_ts:
                     continue
                 seen.add(local)
-                free = [t for t in fitting
-                        if not any(s < start_ts + duration and start_ts < e for s, e in taken.get(t, ()))]
+                is_free = lambda t: not any(s < start_ts + duration and start_ts < e
+                                            for s, e in taken.get(t, ()))
+                singles = [[t["id"]] for t in restaurant["tables"]
+                           if t["capacity"] >= party_size and is_free(t["id"])]
+                pairs = [pair for pair in restaurant["combinable"]
+                         if sum(capacities[t] for t in pair) >= party_size and all(map(is_free, pair))]
                 slots.append({"starts_at_local": local, "starts_at": timeutil.to_rfc3339(start_ts, zone),
-                              "available_table_ids": free})
+                              "available_table_ids": [ids[0] for ids in singles],
+                              "available_options": [
+                                  {"table_ids": ids, "capacity": sum(capacities[t] for t in ids)}
+                                  for ids in singles + pairs]})
         return slots
 
     # ---- reservations ----
@@ -210,18 +237,22 @@ class Service:
 
     def _create(self, user_id, body):
         _require_strings(body, *_BOOKING_STRING_FIELDS)
+        _check_table_field_types(body)
         if "party_size" not in body:
             raise validation_failed("party_size is required")
+        requested = _requested_tables(body)
+        if requested is None:
+            raise validation_failed("table_id or table_ids is required")
         party_size = _valid_party_size(body["party_size"])
         naive = _valid_local_start(body["starts_at_local"])
         restaurant = self.state.restaurants.get(body["restaurant_id"])
         if restaurant is None:
             raise not_found("no such restaurant")
-        table_id, _, start_ts, end_ts = self._resolve_booking(
-            restaurant, body["table_id"], party_size, naive, None)
-        self._require_free(restaurant["id"], table_id, start_ts, end_ts, ignore=())
+        table_ids, _, start_ts, end_ts = self._resolve_booking(
+            restaurant, requested, party_size, naive, None)
+        self._require_free(restaurant["id"], table_ids, start_ts, end_ts, ignore=())
         record = {"id": self.state.allocate_reservation_id(), "reference": self._new_reference(),
-                  "user_id": user_id, "restaurant_id": restaurant["id"], "table_id": table_id,
+                  "user_id": user_id, "restaurant_id": restaurant["id"], "table_ids": table_ids,
                   "party_size": party_size, "status": "confirmed",
                   "starts_at_local": timeutil.format_local(naive), "start_ts": start_ts,
                   "end_ts": end_ts, "created_at": timeutil.utc_now_rfc3339(self.clock())}
@@ -259,7 +290,7 @@ class Service:
             changes = self._parse_changes(parse_object(raw))
             record = self._owned(user_id, reference)
             plan = self._plan_amendment(record, changes)
-            self._require_free(record["restaurant_id"], plan["table_id"], plan["start_ts"], plan["end_ts"],
+            self._require_free(record["restaurant_id"], plan["table_ids"], plan["start_ts"], plan["end_ts"],
                                ignore=(record["id"],))
             record.update(plan)
             return 200, self._view(record)
@@ -290,10 +321,10 @@ class Service:
         plans = [self._plan_amendment(record, change) for record, change in zip(records, changes)]
         listed = {r["id"] for r in records}
         for index, plan in enumerate(plans):
-            self._require_free(records[0]["restaurant_id"], plan["table_id"], plan["start_ts"], plan["end_ts"],
+            self._require_free(records[0]["restaurant_id"], plan["table_ids"], plan["start_ts"], plan["end_ts"],
                                ignore=listed)
             for other in plans[:index]:
-                if other["table_id"] == plan["table_id"] and \
+                if set(other["table_ids"]) & set(plan["table_ids"]) and \
                         other["start_ts"] < plan["end_ts"] and plan["start_ts"] < other["end_ts"]:
                     raise conflict("table_unavailable", "moves overlap each other")
         for record, plan in zip(records, plans):
@@ -333,10 +364,10 @@ class Service:
 
     @staticmethod
     def _parse_changes(body):
-        for field in ("table_id", "starts_at_local"):
-            if field in body and not isinstance(body[field], str):
-                raise malformed_request(f"{field} must be a string")
-        return {k: body[k] for k in ("table_id", "starts_at_local", "party_size") if k in body}
+        if "starts_at_local" in body and not isinstance(body["starts_at_local"], str):
+            raise malformed_request("starts_at_local must be a string")
+        _check_table_field_types(body)
+        return {k: body[k] for k in ("table_id", "table_ids", "starts_at_local", "party_size") if k in body}
 
     def _plan_amendment(self, record, changes):
         """The new values of `record` after `changes`; nothing is modified."""
@@ -347,26 +378,32 @@ class Service:
             else record["party_size"]
         naive = _valid_local_start(changes["starts_at_local"]) if "starts_at_local" in changes else None
         restaurant = self.state.restaurants[record["restaurant_id"]]
-        table_id, party_size, start_ts, end_ts = self._resolve_booking(
-            restaurant, changes.get("table_id", record["table_id"]), party_size, naive, record)
-        return {"table_id": table_id, "party_size": party_size, "start_ts": start_ts, "end_ts": end_ts,
+        table_ids, party_size, start_ts, end_ts = self._resolve_booking(
+            restaurant, _requested_tables(changes) or record["table_ids"], party_size, naive, record)
+        return {"table_ids": table_ids, "party_size": party_size, "start_ts": start_ts, "end_ts": end_ts,
                 "starts_at_local": timeutil.format_local(naive) if naive else record["starts_at_local"]}
 
-    def _resolve_booking(self, restaurant, table_id, party_size, naive, existing):
-        """Validate a booking against its restaurant; returns (table, party, start, end).
+    def _resolve_booking(self, restaurant, table_ids, party_size, naive, existing):
+        """Validate a booking against its restaurant; returns (tables, party, start, end).
 
         `naive` is None for an amendment that keeps the current time (`existing`).
         """
-        table = next((t for t in restaurant["tables"] if t["id"] == table_id), None)
-        if table is None:
+        capacities = {t["id"]: t["capacity"] for t in restaurant["tables"]}
+        if any(t not in capacities for t in table_ids):
             raise not_found("no such table at this restaurant")
+        if len(table_ids) > MAX_COMBINED_TABLES:
+            raise unprocessable("combination_not_allowed", "at most two tables can be combined")
+        if len(table_ids) == 2:
+            table_ids = next((pair for pair in restaurant["combinable"] if set(pair) == set(table_ids)), None)
+            if table_ids is None:
+                raise unprocessable("combination_not_allowed", "those tables are not combinable")
         if naive is None:
             start_ts, end_ts = existing["start_ts"], existing["end_ts"]
         else:
             start_ts, end_ts = self._slot(restaurant, naive)
-        if party_size > table["capacity"]:
+        if party_size > sum(capacities[t] for t in table_ids):
             raise unprocessable("party_exceeds_capacity", "party is larger than the table capacity")
-        return table_id, party_size, start_ts, end_ts
+        return list(table_ids), party_size, start_ts, end_ts
 
     @staticmethod
     def _slot(restaurant, naive):
@@ -390,18 +427,22 @@ class Service:
             raise unprocessable("outside_opening_hours", "the reservation would end after closing")
         return start_ts, end_ts
 
-    def _require_free(self, restaurant_id, table_id, start_ts, end_ts, ignore):
-        """409 when a confirmed booking other than those in `ignore` overlaps the table."""
+    def _require_free(self, restaurant_id, table_ids, start_ts, end_ts, ignore):
+        """409 when a confirmed booking other than those in `ignore` overlaps any of the tables."""
         for res in self.state.reservations.values():
-            if res["restaurant_id"] == restaurant_id and res["table_id"] == table_id and res["status"] == "confirmed" and res["id"] not in ignore \
+            if res["restaurant_id"] == restaurant_id and res["status"] == "confirmed" \
+                    and res["id"] not in ignore and set(res["table_ids"]) & set(table_ids) \
                     and res["start_ts"] < end_ts and start_ts < res["end_ts"]:
-                raise conflict("table_unavailable", "the table is taken for an overlapping interval")
+                raise conflict("table_unavailable", "a table is taken for an overlapping interval")
 
     def _view(self, record):
         zone = timeutil.load_zone(self.state.restaurants[record["restaurant_id"]]["timezone"])
-        return {"reservation_id": record["id"], "reference": record["reference"],
-                "restaurant_id": record["restaurant_id"], "table_id": record["table_id"],
-                "party_size": record["party_size"], "status": record["status"],
+        tables = record["table_ids"]
+        view = {"reservation_id": record["id"], "reference": record["reference"],
+                "restaurant_id": record["restaurant_id"], "table_ids": list(tables)}
+        if len(tables) == 1:
+            view["table_id"] = tables[0]
+        return {**view, "party_size": record["party_size"], "status": record["status"],
                 "starts_at_local": record["starts_at_local"],
                 "starts_at": timeutil.to_rfc3339(record["start_ts"], zone),
                 "ends_at": timeutil.to_rfc3339(record["end_ts"], zone),

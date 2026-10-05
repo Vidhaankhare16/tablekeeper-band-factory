@@ -84,13 +84,17 @@ def _load_dump(state, dumped):
         state.restaurants[normalized["id"]] = normalized
     for record in _expect_list(dumped["reservations"], "reservations"):
         record = _expect_object(record, "reservation")
-        _require_strings(record, "id", "reference", "user_id", "restaurant_id", "table_id",
+        _require_strings(record, "id", "reference", "user_id", "restaurant_id",
                          "status", "starts_at_local", "created_at")
         for field in ("party_size", "start_ts", "end_ts"):
             _require_int(record, field)
         if record["status"] not in STATUSES or record["restaurant_id"] not in state.restaurants:
             raise ValueError("invalid reservation")
-        state.add_reservation({k: record[k] for k in RESERVATION_FIELDS})
+        table_ids = _table_ids(record)
+        known = {t["id"] for t in state.restaurants[record["restaurant_id"]]["tables"]}
+        if not known.issuperset(table_ids):
+            raise ValueError("reservation on unknown table")
+        state.add_reservation({**{k: record[k] for k in RESERVATION_FIELDS}, "table_ids": table_ids})
     for token, user_id in _expect_object(dumped["tokens"], "tokens").items():
         if user_id not in state.users:
             raise ValueError("token of unknown user")
@@ -106,8 +110,21 @@ def _load_dump(state, dumped):
     state.next_reservation = _require_int(dumped, "next_reservation")
 
 
-RESERVATION_FIELDS = ("id", "reference", "user_id", "restaurant_id", "table_id", "party_size",
+RESERVATION_FIELDS = ("id", "reference", "user_id", "restaurant_id", "party_size",
                       "status", "starts_at_local", "start_ts", "end_ts", "created_at")
+
+
+def _table_ids(raw):
+    """The table set of a reservation: `table_ids`, or `table_id` as a set of one (stage 1 form)."""
+    if "table_ids" in raw and "table_id" not in raw:
+        tables = raw["table_ids"]
+        if isinstance(tables, list) and 1 <= len(tables) <= 2 and len(set(tables)) == len(tables) \
+                and all(isinstance(t, str) and t and len(t) <= MAX_ID_LENGTH for t in tables):
+            return list(tables)
+    elif "table_id" in raw and "table_ids" not in raw:
+        _require_id(raw, "table_id")
+        return [raw["table_id"]]
+    raise ValueError("a reservation needs table_id, or table_ids with one or two distinct ids")
 
 
 def _expect_object(value, what):
@@ -165,12 +182,18 @@ def normalize_restaurant(raw):
         label = table.get("label", table["id"])
         tables.append({"id": table["id"], "label": label if isinstance(label, str) else str(label),
                        "capacity": table["capacity"]})
+    combinable = []
+    for pair in _expect_list(raw.get("combinable", []), "combinable"):
+        if not (isinstance(pair, list) and len(pair) == 2 and pair[0] != pair[1]
+                and all(isinstance(t, str) and t in seen for t in pair)):
+            raise ValueError("combinable entries are pairs of distinct tables of the restaurant")
+        combinable.append(list(pair))
     name = raw.get("name", raw["id"])
     return {"id": raw["id"], "name": name if isinstance(name, str) else str(name),
             "timezone": raw["timezone"], "slot_minutes": raw["slot_minutes"],
             "reservation_duration_minutes": raw["reservation_duration_minutes"],
             "cancellation_cutoff_minutes": raw["cancellation_cutoff_minutes"],
-            "opening_hours": hours, "tables": tables}
+            "opening_hours": hours, "tables": tables, "combinable": combinable}
 
 
 def _require_id(obj, field):
@@ -215,8 +238,9 @@ def _load_fixture_user(state, raw):
 
 
 def _load_fixture_reservation(state, raw):
-    for field in ("id", "reference", "user_id", "restaurant_id", "table_id"):
+    for field in ("id", "reference", "user_id", "restaurant_id"):
         _require_id(raw, field)
+    table_ids = _table_ids(raw)
     _require_strings(raw, "starts_at_local")
     party_size = _require_int(raw, "party_size")
     status = raw.get("status", "confirmed")
@@ -227,18 +251,18 @@ def _load_fixture_reservation(state, raw):
         raise ValueError("reference must be 6 to 12 characters of A-Z0-9")
     if naive is None or status not in STATUSES or not isinstance(created_at, str) \
             or raw["id"] in state.reservations or raw["reference"] in state.by_reference \
-            or all(t["id"] != raw["table_id"] for t in restaurant["tables"]):
+            or not {t["id"] for t in restaurant["tables"]}.issuperset(table_ids):
         raise ValueError("invalid or duplicate seeded reservation")
     start_ts, _ = timeutil.resolve_local(timeutil.load_zone(restaurant["timezone"]), naive)
     end_ts = start_ts + restaurant["reservation_duration_minutes"] * 60
     if status == "confirmed" and any(
             other["status"] == "confirmed" and other["restaurant_id"] == raw["restaurant_id"]
-            and other["table_id"] == raw["table_id"] and other["start_ts"] < end_ts and start_ts < other["end_ts"]
+            and set(other["table_ids"]) & set(table_ids) and other["start_ts"] < end_ts and start_ts < other["end_ts"]
             for other in state.reservations.values()):
         raise ValueError("seeded reservations overlap on a table")
     state.add_reservation({
         "id": raw["id"], "reference": raw["reference"], "user_id": raw["user_id"],
-        "restaurant_id": raw["restaurant_id"], "table_id": raw["table_id"],
+        "restaurant_id": raw["restaurant_id"], "table_ids": table_ids,
         "party_size": party_size, "status": status,
         "starts_at_local": timeutil.format_local(naive), "start_ts": start_ts,
         "end_ts": end_ts, "created_at": created_at})
