@@ -16,7 +16,8 @@ STATIC_ROOT = Path(__file__).resolve().parent.parent / "static"
 SCREENS = {"/": "index.html", "/signup": "signup.html", "/login": "login.html", "/lookup": "lookup.html"}
 _REFERENCE_PATH = re.compile(r"/reservations/([^/]+)(/cancel|/history|/decision)?")
 _POLICIES_PATH = re.compile(r"/restaurants/([^/]+)/policies")
-_SERIES_PATH = re.compile(r"/series/([^/]+)")
+_SERIES_PATH = re.compile(r"/series/([^/]+)(/amend)?")
+_REPLANS_PATH = re.compile(r"/restaurants/([^/]+)/replans(?:/([^/]+)/apply)?")
 _RESTAURANT_PATH = re.compile(r"/restaurants/([^/]+)")
 
 
@@ -132,9 +133,16 @@ class Handler(BaseHTTPRequestHandler):
             return service.list_policies(match.group(1))
         if match and method == "POST":
             return service.publish_policy(auth, match.group(1), key, raw)
+        replans = _REPLANS_PATH.fullmatch(path)
+        if replans and method == "POST":
+            if replans.group(2):
+                return service.apply_replan(auth, replans.group(1), replans.group(2), key, raw)
+            return service.preview_replan(auth, replans.group(1), key, raw)
         series = _SERIES_PATH.fullmatch(path)
-        if series and method == "GET":
+        if series and method == "GET" and not series.group(2):
             return service.get_series(auth, series.group(1))
+        if series and method == "POST" and series.group(2):
+            return service.amend_series(auth, series.group(1), key, raw)
         match = _REFERENCE_PATH.fullmatch(path)
         if match:
             reference, action = match.group(1), match.group(2)
@@ -151,7 +159,7 @@ class Handler(BaseHTTPRequestHandler):
         page = static_file(path) if method == "GET" else None
         if page:
             return 200, page
-        if match or series or path in {known for _, known in routes}:
+        if match or series or replans or path in {known for _, known in routes}:
             raise ApiError(405, "method_not_allowed", "method not allowed")
         raise ApiError(404, "not_found", "no such endpoint")
 

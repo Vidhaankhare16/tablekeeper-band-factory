@@ -2,6 +2,7 @@
 import copy
 import re
 import time
+from datetime import timedelta
 
 from . import timeutil
 from .errors import validation_failed
@@ -23,10 +24,12 @@ class State:
         self.reservations = {}   # reservation id -> reservation record
         self.by_reference = {}   # reference -> reservation id
         self.series = {}         # series id -> series record
+        self.plans = {}          # plan id -> seating plan
         self.receipts = {}       # (user id, method, path, key) -> {"body", "response"}
         self.next_user = 1
         self.next_reservation = 1
         self.next_series = 1
+        self.next_plan = 1
 
     def allocate_user_id(self):
         while f"u_{self.next_user}" in self.users:
@@ -49,6 +52,13 @@ class State:
         self.next_series += 1
         return series_id
 
+    def allocate_plan_id(self):
+        while f"plan_{self.next_plan}" in self.plans:
+            self.next_plan += 1
+        plan_id = f"plan_{self.next_plan}"
+        self.next_plan += 1
+        return plan_id
+
     def add_user(self, user):
         self.users[user["id"]] = user
         self.user_by_email[user["email"].lower()] = user["id"]
@@ -66,6 +76,7 @@ class State:
             "restaurants": list(self.restaurants.values()),
             "reservations": list(self.reservations.values()),
             "series": list(self.series.values()),
+            "plans": list(self.plans.values()),
             "receipts": [
                 {"user_id": uid, "method": method, "path": path, "key": key,
                  "body": rec["body"], "response": rec["response"]}
@@ -74,6 +85,7 @@ class State:
             "next_user": self.next_user,
             "next_reservation": self.next_reservation,
             "next_series": self.next_series,
+            "next_plan": self.next_plan,
         })
 
     @classmethod
@@ -92,9 +104,12 @@ def _load_dump(state, dumped):
         user = _expect_object(user, "user")
         _require_strings(user, "id", "email", "display_name", "password_hash")
         state.add_user({k: user[k] for k in ("id", "email", "display_name", "password_hash")})
+    unrevised = []
     for restaurant in _expect_list(dumped["restaurants"], "restaurants"):
         normalized = normalize_restaurant(restaurant)
         state.restaurants[normalized["id"]] = normalized
+        if "revision" not in restaurant:
+            unrevised.append(normalized)
     for record in _expect_list(dumped["reservations"], "reservations"):
         record = _expect_object(record, "reservation")
         _require_strings(record, "id", "reference", "user_id", "restaurant_id",
@@ -130,6 +145,22 @@ def _load_dump(state, dumped):
         state.series[series["id"]] = {k: series[k] for k in
                                       ("id", "user_id", "restaurant_id", "interval_weeks", "revision",
                                        "occurrences")}
+        state.series[series["id"]]["anchor_date"] = series.get("anchor_date") or \
+            _derive_anchor_date(state, series)
+    for restaurant in unrevised:  # exports from before restaurant revisions: one per booking write
+        restaurant["revision"] = sum(
+            1 + (r["status"] == "cancelled") for r in state.reservations.values()
+            if r["restaurant_id"] == restaurant["id"])
+    for plan in _expect_list(dumped.get("plans", []), "plans"):
+        plan = _expect_object(plan, "plan")
+        _require_strings(plan, "id", "restaurant_id")
+        _require_int(plan, "revision")
+        if plan["restaurant_id"] not in state.restaurants or not isinstance(plan["applied"], bool) \
+                or not isinstance(plan["response"], dict) or not isinstance(plan["assignments"], list) \
+                or not isinstance(plan["closure"], dict):
+            raise ValueError("invalid plan")
+        state.plans[plan["id"]] = {k: plan[k] for k in ("id", "restaurant_id", "revision", "closure",
+                                                         "assignments", "response", "applied")}
     for token, user_id in _expect_object(dumped["tokens"], "tokens").items():
         if user_id not in state.users:
             raise ValueError("token of unknown user")
@@ -144,6 +175,21 @@ def _load_dump(state, dumped):
     state.next_user = _require_int(dumped, "next_user")
     state.next_reservation = _require_int(dumped, "next_reservation")
     state.next_series = _require_int(dumped, "next_series") if "next_series" in dumped else 1
+    state.next_plan = _require_int(dumped, "next_plan") if "next_plan" in dumped else 1
+
+
+def _derive_anchor_date(state, series):
+    """The scheduled date of occurrence 0 of a series exported before dates were recorded."""
+    zero = None
+    for occurrence in series["occurrences"]:
+        record = state.reservations[state.by_reference[occurrence["reference"]]]
+        local = timeutil.parse_local_datetime(record["starts_at_local"])
+        shifted = local - timedelta(weeks=occurrence["index"] * series["interval_weeks"])
+        if occurrence["index"] == 0:
+            zero = shifted
+        if not occurrence["exception"]:  # an unchanged occurrence still sits on its scheduled date
+            return timeutil.format_local(shifted)[:10]
+    return timeutil.format_local(zero)[:10]
 
 
 def add_stage_3_defaults(record, restaurant):
@@ -237,13 +283,20 @@ def normalize_restaurant(raw):
             raise ValueError("policy versions must count up from 1")
         policies.append({**parse_policy(policy, [t["id"] for t in tables]), "policy_version": version})
     revision = _require_int(raw, "revision") if "revision" in raw else 0
+    closures = []
+    for closure in _expect_list(raw.get("closures", []), "closures"):
+        closure = _expect_object(closure, "closure")
+        if closure["table_id"] not in seen or _require_int(closure, "from_ts") >= _require_int(closure, "to_ts"):
+            raise ValueError("invalid closure")
+        closures.append({k: closure[k] for k in ("table_id", "from_ts", "to_ts", "plan_id")})
     name = raw.get("name", raw["id"])
     return {"id": raw["id"], "name": name if isinstance(name, str) else str(name),
             "timezone": raw["timezone"], "slot_minutes": raw["slot_minutes"],
             "reservation_duration_minutes": raw["reservation_duration_minutes"],
             "cancellation_cutoff_minutes": raw["cancellation_cutoff_minutes"],
             "opening_hours": hours, "tables": tables, "combinable": combinable,
-            "manager_user_ids": list(managers), "policies": policies, "revision": revision}
+            "manager_user_ids": list(managers), "policies": policies, "revision": revision,
+            "closures": closures}
 
 
 def _require_id(obj, field):

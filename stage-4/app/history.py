@@ -27,8 +27,8 @@ def amendment_changes(old, new):
     return changes
 
 
-def append_entry(record, at, event, changes):
+def append_entry(record, at, event, changes, **extra):
     """Append the next entry, stamped with the record's current revision and terms."""
     record["history"].append({"seq": len(record["history"]) + 1, "at": at, "event": event,
                               "changes": changes, "revision": record["revision"],
-                              "accepted_terms": copy.deepcopy(record["terms"])})
+                              "accepted_terms": copy.deepcopy(record["terms"]), **extra})

@@ -5,9 +5,9 @@ import re
 import secrets
 import threading
 import time
-from datetime import timedelta
+from datetime import datetime, timedelta
 
-from . import timeutil
+from . import replanning, timeutil
 from .booking_rules import plan_booking
 from .errors import (ApiError, conflict, malformed_request, missing_idempotency_key, not_found,
                      unauthenticated, validation_failed)
@@ -24,7 +24,7 @@ REFERENCE_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
 REFERENCE_LENGTH = 6
 _EMAIL = re.compile(r"[^@\s]+@[^@\s]+")
 _DIGITS = re.compile(r"[0-9]{1,18}", re.ASCII)
-_INTERNAL_RESTAURANT_FIELDS = ("manager_user_ids", "policies", "revision")
+_INTERNAL_RESTAURANT_FIELDS = ("manager_user_ids", "policies", "revision", "closures")
 _BOOKING_STRING_FIELDS = ("restaurant_id", "starts_at_local")
 MIN_SERIES_COUNT, MAX_SERIES_COUNT = 2, 12
 MAX_INTERVAL_WEEKS = 4
@@ -186,8 +186,7 @@ class Service:
         with self.lock:
             user_id = self.authenticate(authorization)
             restaurant = self._restaurant(restaurant_id)
-            if user_id not in restaurant["manager_user_ids"]:
-                raise ApiError(403, "forbidden", "only managers can publish policies")
+            self._require_manager(user_id, restaurant)
             body = parse_object(raw)
             return self._idempotent(user_id, "POST", path, idempotency_key, body,
                                     lambda: self._publish(restaurant, body))
@@ -229,6 +228,8 @@ class Service:
             if res["restaurant_id"] == restaurant["id"] and res["status"] == "confirmed":
                 for table_id in res["table_ids"]:
                     taken.setdefault(table_id, []).append((res["start_ts"], res["end_ts"]))
+        for closure in restaurant["closures"]:
+            taken.setdefault(closure["table_id"], []).append((closure["from_ts"], closure["to_ts"]))
         capacities = policy["capacities"]
         slots, seen = [], set()
         for entry in sorted((h for h in policy["opening_hours"] if h["weekday"] == weekday),
@@ -385,18 +386,8 @@ class Service:
         if len({r["restaurant_id"] for r in records}) != 1:
             raise validation_failed("all bookings must belong to the same restaurant")
         plans = [self._prepare_change(record, change) for record, change in zip(records, changes)]
-        resulting = [plan or record for record, plan in zip(records, plans)]
-        listed = {r["id"] for r in records}
         restaurant_id = records[0]["restaurant_id"]
-        for index, plan in enumerate(plans):
-            if plan is None:
-                continue
-            self._require_free(restaurant_id, plan["table_ids"], plan["start_ts"], plan["end_ts"],
-                               ignore=listed)
-            for other_index, other in enumerate(resulting):
-                if other_index != index and set(other["table_ids"]) & set(plan["table_ids"]) \
-                        and other["start_ts"] < plan["end_ts"] and plan["start_ts"] < other["end_ts"]:
-                    raise conflict("table_unavailable", "moves overlap each other")
+        self._check_occupancy(restaurant_id, list(zip(records, plans)))
         changed = [(record, plan) for record, plan in zip(records, plans) if plan is not None]
         for record, plan in changed:
             self._apply_change(record, plan)
@@ -457,9 +448,161 @@ class Service:
             record["series_id"], record["series_index"] = series_id, index
             occurrences.append({"index": index, "reference": record["reference"], "exception": False})
         series = {"id": series_id, "user_id": user_id, "restaurant_id": restaurant["id"],
-                  "interval_weeks": interval, "revision": 1, "occurrences": occurrences}
+                  "interval_weeks": interval, "revision": 1, "occurrences": occurrences,
+                  "anchor_date": anchor["starts_at_local"][:10]}
         self.state.series[series_id] = series
         restaurant["revision"] += 1
+        return self._series_view(series)
+
+    def _require_manager(self, user_id, restaurant):
+        if user_id not in restaurant["manager_user_ids"]:
+            raise ApiError(403, "forbidden", "only managers can do that")
+
+    # ---- seating changes ----
+
+    def preview_replan(self, authorization, restaurant_id, idempotency_key, raw):
+        path = f"/restaurants/{restaurant_id}/replans"
+        with self.lock:
+            user_id = self.authenticate(authorization)
+            restaurant = self._restaurant(restaurant_id)
+            self._require_manager(user_id, restaurant)
+            body = parse_object(raw)
+            return self._idempotent(user_id, "POST", path, idempotency_key, body,
+                                    lambda: self._preview(restaurant, body))
+
+    def _preview(self, restaurant, body):
+        _require_strings(body, "table_id", "from", "to")
+        start, end = replanning.parse_instant(body["from"]), replanning.parse_instant(body["to"])
+        if start is None or end is None or start >= end:
+            raise validation_failed("from and to must be instants with offsets, from before to")
+        if all(t["id"] != body["table_id"] for t in restaurant["tables"]):
+            raise not_found("no such table at this restaurant")
+        considered = sorted((r for r in self.state.reservations.values()
+                             if r["restaurant_id"] == restaurant["id"] and r["status"] == "confirmed"
+                             and replanning.overlaps(r["start_ts"], r["end_ts"], start, end)),
+                            key=lambda r: r["reference"])
+        if len(restaurant["tables"]) > replanning.MAX_TABLES or len(restaurant["combinable"]) \
+                > replanning.MAX_PAIRS or len(considered) > replanning.MAX_BOOKINGS:
+            raise ApiError(422, "planning_limit", "too many tables, pairs or bookings to plan exactly")
+        options = replanning.options_of(restaurant)
+        considered_ids = {r["id"] for r in considered}
+        fixed = [r for r in self.state.reservations.values()
+                 if r["restaurant_id"] == restaurant["id"] and r["status"] == "confirmed"
+                 and r["id"] not in considered_ids]
+        closures = restaurant["closures"] + [{"table_id": body["table_id"], "from_ts": start, "to_ts": end}]
+
+        def blocked(booking, tables):
+            return any(set(f["table_ids"]) & set(tables)
+                       and replanning.overlaps(f["start_ts"], f["end_ts"], booking["start_ts"], booking["end_ts"])
+                       for f in fixed) or any(
+                c["table_id"] in tables
+                and replanning.overlaps(c["from_ts"], c["to_ts"], booking["start_ts"], booking["end_ts"])
+                for c in closures)
+
+        bookings = [{**r, "capacities": r["terms"]["capacities"]} for r in considered]
+        ranks = replanning.best_assignment(bookings, options, blocked)
+        if ranks is None:
+            raise conflict("no_feasible_plan", "no seating arrangement keeps every booking")
+        assignments = []
+        for record, rank in zip(considered, ranks):
+            tables = list(options[rank])
+            assignments.append({"reference": record["reference"], "table_ids": tables,
+                                "changed": set(tables) != set(record["table_ids"])})
+        unused = sum(sum(r["terms"]["capacities"][t] for t in a["table_ids"]) - r["party_size"]
+                     for r, a in zip(considered, assignments))
+        plan_id = self.state.allocate_plan_id()
+        response = {"plan_id": plan_id, "restaurant_revision": restaurant["revision"],
+                    "closure": {"table_id": body["table_id"], "from": body["from"], "to": body["to"]},
+                    "assignments": assignments, "moved_count": sum(a["changed"] for a in assignments),
+                    "unused_seats": unused}
+        self.state.plans[plan_id] = {
+            "id": plan_id, "restaurant_id": restaurant["id"], "revision": restaurant["revision"],
+            "closure": {"table_id": body["table_id"], "from_ts": start, "to_ts": end},
+            "assignments": copy.deepcopy(assignments), "response": copy.deepcopy(response), "applied": False}
+        return response
+
+    def apply_replan(self, authorization, restaurant_id, plan_id, idempotency_key, raw):
+        path = f"/restaurants/{restaurant_id}/replans/{plan_id}/apply"
+        with self.lock:
+            user_id = self.authenticate(authorization)
+            restaurant = self._restaurant(restaurant_id)
+            self._require_manager(user_id, restaurant)
+            body = parse_object(raw)
+            return self._idempotent(user_id, "POST", path, idempotency_key, body,
+                                    lambda: self._apply(restaurant, plan_id))
+
+    def _apply(self, restaurant, plan_id):
+        plan = self.state.plans.get(plan_id)
+        if plan is None or plan["restaurant_id"] != restaurant["id"]:
+            raise not_found("no such plan")
+        if plan["applied"]:
+            raise conflict("plan_already_applied", "that plan has already been applied")
+        if plan["revision"] != restaurant["revision"]:
+            raise conflict("stale_plan", "the restaurant has changed since that plan was made")
+        records = [self.state.reservations[self.state.by_reference[a["reference"]]]
+                   for a in plan["assignments"]]
+        moved = []
+        for record, assignment in zip(records, plan["assignments"]):
+            if assignment["changed"]:
+                before, record["table_ids"] = record["table_ids"], list(assignment["table_ids"])
+                record["revision"] += 1
+                append_entry(record, self._now(), "reassigned",
+                             [{"field": "table_ids", "from": before, "to": list(record["table_ids"])}],
+                             plan_id=plan_id)
+                moved.append(record)
+        restaurant["closures"].append({**plan["closure"], "plan_id": plan_id})
+        plan["applied"] = True
+        restaurant["revision"] += 1
+        self._touch_series(moved, mark_exceptions=False)
+        return {"plan_id": plan_id, "restaurant_revision": restaurant["revision"],
+                "reservations": [self._view(r) for r in records]}
+
+    # ---- recurring amendments ----
+
+    def amend_series(self, authorization, series_id, idempotency_key, raw):
+        path = f"/series/{series_id}/amend"
+        with self.lock:
+            user_id = self.authenticate(authorization)
+            body = parse_object(raw)
+            return self._idempotent(user_id, "POST", path, idempotency_key, body,
+                                    lambda: self._amend_series(user_id, series_id, body))
+
+    def _amend_series(self, user_id, series_id, body):
+        series = self.state.series.get(series_id)
+        if series is None or series["user_id"] != user_id:
+            raise not_found("no such series")
+        expected, from_index, local_time = (body.get(k) for k in ("expected_revision", "from_index", "local_time"))
+        if isinstance(expected, bool) or not isinstance(expected, int) or expected < 1:
+            raise validation_failed("expected_revision must be a positive integer")
+        if isinstance(from_index, bool) or not isinstance(from_index, int) \
+                or not 0 <= from_index < len(series["occurrences"]):
+            raise validation_failed("from_index must be an occurrence index")
+        clock = timeutil.parse_clock(local_time)
+        if clock is None:
+            raise validation_failed("local_time must be HH:MM")
+        if expected != series["revision"]:
+            raise conflict("stale_revision", "the series has changed since that revision")
+        restaurant = self.state.restaurants[series["restaurant_id"]]
+        anchor_date = timeutil.parse_date(series["anchor_date"])
+        entries = []
+        for occurrence in series["occurrences"][from_index:]:
+            record = self.state.reservations[self.state.by_reference[occurrence["reference"]]]
+            if record["status"] == "cancelled" or occurrence["exception"]:
+                continue
+            day = anchor_date + timedelta(weeks=occurrence["index"] * series["interval_weeks"])
+            naive = day.replace(hour=clock // 60, minute=clock % 60)
+            if timeutil.format_local(naive) == record["starts_at_local"]:
+                continue
+            self._require_before_cutoff(record)
+            plan = self._plan(restaurant, record["table_ids"], record["party_size"], naive)
+            entries.append((record, {**plan, "party_size": record["party_size"],
+                                     "starts_at_local": timeutil.format_local(naive)}))
+        self._check_occupancy(restaurant["id"], entries)
+        for record, plan in entries:
+            self._apply_change(record, plan)
+        if entries:
+            series["revision"] += 1
+            restaurant["revision"] += 1
         return self._series_view(series)
 
     def _series_view(self, series):
@@ -578,6 +721,26 @@ class Service:
                     and res["id"] not in ignore and set(res["table_ids"]) & set(table_ids) \
                     and res["start_ts"] < end_ts and start_ts < res["end_ts"]:
                 raise conflict("table_unavailable", "a table is taken for an overlapping interval")
+        for closure in self.state.restaurants[restaurant_id]["closures"]:
+            if closure["table_id"] in table_ids and closure["from_ts"] < end_ts and start_ts < closure["to_ts"]:
+                raise conflict("table_unavailable", "a table is closed during that interval")
+
+    def _check_occupancy(self, restaurant_id, entries):
+        """409 unless the planned changes fit together and with every unlisted booking.
+
+        entries: (record, plan or None) pairs; a record without a plan keeps its occupancy.
+        """
+        listed = {record["id"] for record, _ in entries}
+        resulting = [plan or record for record, plan in entries]
+        for index, (_, plan) in enumerate(entries):
+            if plan is None:
+                continue
+            self._require_free(restaurant_id, plan["table_ids"], plan["start_ts"], plan["end_ts"],
+                               ignore=listed)
+            for other_index, other in enumerate(resulting):
+                if other_index != index and set(other["table_ids"]) & set(plan["table_ids"]) \
+                        and other["start_ts"] < plan["end_ts"] and plan["start_ts"] < other["end_ts"]:
+                    raise conflict("table_unavailable", "bookings overlap each other")
 
     def _view(self, record):
         zone = timeutil.load_zone(self.state.restaurants[record["restaurant_id"]]["timezone"])
