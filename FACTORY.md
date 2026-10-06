@@ -170,6 +170,19 @@ Python. We can publish them on request. They hold no factory logic: everything t
   references. It quoted the failing line and told the examiner to select by reference. The lead
   routed the fix, and the examiner pushed `981cd03`. The review changed the work, and the
   examiner's suite stopped being flaky.
+- **What review changed in the judged run, plainly.** No product revision was rejected: each
+  stage's delivery passed the gatekeeper's reproduction on round 1, and the room shows why rather
+  than asserting it. What review *did* change, all traceable in `room.json` and git:
+
+  | When (UTC) | Who found it | What | Change |
+  |---|---|---|---|
+  | 12:46 | gatekeeper, reviewing stage 4 | 1 of 700 examiner checks failed intermittently; reproduced 5/5 that the service was right and the check was order-dependent | examiner commit `981cd03` |
+  | 10:44 | examiner, running its browser checks against surface's delivered UI | check bugs: a shared-Chromium fixture, the timing of the combined-table refresh, a weak title proxy | examiner commit `a170621` |
+  | 10:15, 11:09, 12:26 | examiner, validating each ledger against the running product | five, some and four first-run failures respectively, each traced to the *check*, not the product ("no check was weakened") | fixed before each `LEDGER` |
+
+  So the safety net was exercised, and it corrected itself. It just found nothing wrong with the
+  product it reviewed. The run-1 builder's self-check (above) is the one case of the factory
+  catching a product defect, and it was fixed before handoff.
 - **Bounded loops.** After six rejected rounds on one stage, the lead stops widening scope and
   records known gaps rather than spinning. A stage never starts while the previous one is
   unaccepted.
