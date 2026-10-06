@@ -271,3 +271,20 @@ event harness in isolated mode (internal network, 2 vCPU, 2 GiB):
 `python -m harness check` on the fresh clone: **ok** (gates 1 and 2, mandate vocabulary for both tracks, and the credential scan, room.json included). We also searched room.json by hand for every credential format we used (BAND agent and user keys, GitHub and Anthropic tokens): none found. Nothing in `stage-N/`, `checks/` or
 `evidence/` was written or changed by a human. The only human commits are the factory setup before
 the dispatch and README.md, FACTORY.md and `room.json` after the final report.
+
+### One gap we found after the run
+
+After submitting, we ran our `stage-4/` against more independent, spec-derived suites, including
+other teams' public ones. This was read-only, and no code was changed. Most disagreements were
+different readings of ambiguous sentences. One is a real gap. Suppose a booking's response is lost, a
+manager then applies a replan that moves the booking, and the diner presses "Try again safely". The
+API correctly replays the original receipt (stage 4: "Earlier booking … receipts … remain valid").
+The UI, however, builds the confirmation from that receipt, so it shows the old table, although stage
+4 requires that "confirmation … screens must reflect an applied plan". **Find a booking** shows the
+correct current table.
+
+Why the factory missed it: the examiner's ledger turns each normative sentence into its own checks.
+Both sentences passed separately, and nothing tested them together. The change for the next run is
+generic: for every guarantee from an earlier stage, the examiner adds checks that combine it with
+each new stage's state-changing features. Any screen built from a stored or replayed response is
+checked after another actor has changed the record. We left the code as the band delivered it.
